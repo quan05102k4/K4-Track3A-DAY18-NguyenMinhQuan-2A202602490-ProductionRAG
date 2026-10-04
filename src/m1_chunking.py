@@ -86,29 +86,71 @@ def chunk_basic(text: str, chunk_size: int = 500, metadata: dict | None = None) 
 # ─── Strategy 1: Semantic Chunking ───────────────────────
 
 
+_encoder = None
+
+
+def _get_encoder():
+    """Load embedding model một lần duy nhất (lazy)."""
+    global _encoder
+    if _encoder is None:
+        from sentence_transformers import SentenceTransformer
+        _encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _encoder
+
+
 def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
                    metadata: dict | None = None) -> list[Chunk]:
     """
     Split text by sentence similarity — nhóm câu cùng chủ đề.
     Tốt hơn basic vì không cắt giữa ý.
     """
-    # TODO: Implement semantic chunking
-    # 1. from sentence_transformers import SentenceTransformer
-    #    from numpy import dot
-    #    from numpy.linalg import norm
-    # 2. metadata = metadata or {}
-    # 3. Split text thành sentences: re.split(r'(?<=[.!?])\s+|\n\n', text)
-    # 4. model = SentenceTransformer("all-MiniLM-L6-v2")
-    #    embeddings = model.encode(sentences)
-    # 5. cosine_sim(a, b) = dot(a, b) / (norm(a) * norm(b) + 1e-9)
-    # 6. Duyệt từ sentence[1]:
-    #      - sim(embedding[i-1], embedding[i]) < threshold → tách chunk mới
-    #      - else: gộp vào chunk hiện tại
-    # 7. Return [Chunk(text=joined_group, metadata={..., "strategy": "semantic"})]
-    return []
+    import numpy as np
+
+    metadata = metadata or {}
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n\n', text) if s and s.strip()]
+    if not sentences:
+        return []
+
+    embeddings = _get_encoder().encode(sentences)
+
+    groups = [[sentences[0]]]
+    for i in range(1, len(sentences)):
+        a, b = embeddings[i - 1], embeddings[i]
+        sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+        if sim < threshold:
+            groups.append([sentences[i]])  # người viết chuyển ý → mở chunk mới
+        else:
+            groups[-1].append(sentences[i])
+
+    return [Chunk(text=" ".join(g), metadata={**metadata, "strategy": "semantic", "chunk_index": idx})
+            for idx, g in enumerate(groups)]
 
 
 # ─── Strategy 2: Hierarchical Chunking ──────────────────
+
+
+def _pack(units: list[str], size: int) -> list[str]:
+    """Gom các đơn vị (đoạn văn) liên tiếp thành nhóm ≤ size ký tự.
+    Đơn vị quá dài được tách tiếp theo câu; câu vẫn quá dài thì cắt theo ký tự."""
+    groups, cur = [], ""
+    for unit in units:
+        if len(unit) > size:
+            if cur:
+                groups.append(cur)
+                cur = ""
+            sentences = [s for s in re.split(r'(?<=[.!?])\s+', unit) if s]
+            if len(sentences) > 1:
+                groups.extend(_pack(sentences, size))
+            else:
+                groups.extend(unit[i:i + size] for i in range(0, len(unit), size))
+        elif cur and len(cur) + 2 + len(unit) > size:
+            groups.append(cur)
+            cur = unit
+        else:
+            cur = f"{cur}\n\n{unit}" if cur else unit
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
@@ -121,16 +163,18 @@ def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
     Returns:
         (parents, children) — mỗi child có parent_id link đến parent.
     """
-    # TODO: Implement hierarchical chunking
-    # 1. metadata = metadata or {}
-    # 2. Split text bằng "\n\n" → paragraphs
-    # 3. Gộp paragraphs thành parent chunks (mỗi parent ≤ parent_size chars):
-    #      pid = f"parent_{len(parents)}"
-    #      parents.append(Chunk(text=..., metadata={..., "chunk_type": "parent", "parent_id": pid}))
-    # 4. Mỗi parent → split thành children (mỗi child ≤ child_size chars):
-    #      children.append(Chunk(text=..., metadata={..., "chunk_type": "child"}, parent_id=pid))
-    # 5. return (parents, children)
-    return ([], [])
+    metadata = metadata or {}
+    src = metadata.get("source", "doc")
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+    parents, children = [], []
+    for body in _pack(paragraphs, parent_size):
+        pid = f"{src}_parent_{len(parents)}"
+        parents.append(Chunk(text=body, metadata={**metadata, "chunk_type": "parent", "parent_id": pid}))
+        for sub in _pack(body.split("\n\n"), child_size):
+            children.append(Chunk(text=sub, metadata={**metadata, "chunk_type": "child", "parent_id": pid},
+                                  parent_id=pid))
+    return parents, children
 
 
 # ─── Strategy 3: Structure-Aware Chunking ────────────────
@@ -141,14 +185,22 @@ def chunk_structure_aware(text: str, metadata: dict | None = None) -> list[Chunk
     Parse markdown headers → chunk theo logical structure.
     Giữ nguyên tables, code blocks, lists — không cắt giữa chừng.
     """
-    # TODO: Implement structure-aware chunking
-    # 1. metadata = metadata or {}
-    # 2. sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
-    # 3. Duyệt sections:
-    #      - Nếu match header (^#{1,3}\s+): lưu header hiện tại, tạo chunk cho content trước đó
-    #      - Else: gộp vào content hiện tại
-    # 4. Return [Chunk(text=header+content, metadata={..., "section": header, "strategy": "structure"})]
-    return []
+    metadata = metadata or {}
+    # parts = [phần trước heading đầu, heading_1, nội dung_1, heading_2, nội dung_2, ...]
+    parts = re.split(r'^(#{1,3}\s+.+)$', text, flags=re.MULTILINE)
+
+    chunks = []
+    intro = parts[0].strip()
+    if intro:
+        chunks.append(Chunk(text=intro, metadata={**metadata, "section": "", "strategy": "structure"}))
+
+    for i in range(1, len(parts), 2):
+        heading = parts[i].strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        section = re.sub(r'^#{1,3}\s+', '', heading)
+        content = f"{heading}\n\n{body}" if body else heading
+        chunks.append(Chunk(text=content, metadata={**metadata, "section": section, "strategy": "structure"}))
+    return chunks
 
 
 # ─── A/B Test: Compare All Strategies ────────────────────
