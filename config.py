@@ -5,8 +5,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- API Keys ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# --- LLM (OpenAI) ---
+LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_BASE_URL = None  # None = endpoint mặc định của OpenAI
+LLM_MODEL = "gpt-4o-mini"
 
 # --- Qdrant ---
 QDRANT_HOST = "localhost"
